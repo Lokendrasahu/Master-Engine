@@ -30,8 +30,7 @@ jobs:
 
       # ==================================================================
       # [PHASE 2]: ZERO-DOWNTIME HANDOVER (Isolated per Client Repo)
-      # CONSTRAINT: Must only cancel previous runs of THIS specific client repository
-      # to prevent overlap crashes.
+      # CONSTRAINT: Cancels ONLY the previous runs of THIS specific client repo.
       # ==================================================================
       - name: 🤝 Execute Stateful Handover
         env:
@@ -48,25 +47,24 @@ jobs:
 
       # ==================================================================
       # [PHASE 3]: CLOUDFLARE R2 SYNC (Download State)
-      # CONSTRAINT: No MongoDB or Supabase. Everything is natively stored in R2
-      # under a unique folder named after the CLIENT_ID.
+      # CONSTRAINT: Folder name is based on CLIENT_MOBILE for easy identification.
       # ==================================================================
       - name: ☁️ Download State from Cloudflare R2
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET_NAME }}
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
         run: |
-          echo "Pulling Client Data from R2 Storage: $CLIENT_ID"
+          echo "Pulling Client Data from R2 Storage: $CLIENT_MOBILE"
           
           # 1. Download n8n Database
-          aws s3 cp s3://$BUCKET/$CLIENT_ID/database.sqlite n8n_data/database.sqlite --endpoint-url $R2_ENDPOINT || echo "Fresh n8n deployment."
+          aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/database.sqlite n8n_data/database.sqlite --endpoint-url $R2_ENDPOINT || echo "Fresh n8n deployment."
           
           # 2. Download WhatsApp Session (Local Auth ZIP)
-          aws s3 cp s3://$BUCKET/$CLIENT_ID/wa_auth.zip wa_auth.zip --endpoint-url $R2_ENDPOINT || echo "No existing WA session."
+          aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip wa_auth.zip --endpoint-url $R2_ENDPOINT || echo "No existing WA session."
           if [ -f wa_auth.zip ]; then
             unzip wa_auth.zip -d whatsapp/ || true
             rm wa_auth.zip
@@ -89,16 +87,13 @@ jobs:
           sudo chmod -R 777 n8n_data
 
       # ==================================================================
-      # [PHASE 5]: MICROSERVICES DEPLOYMENT
-      # CONSTRAINT: WA Endpoints are internal JSON APIs. Caddy strictly blocks
-      # public access to them. n8n Database runs on diet (No success logs saved).
+      # [PHASE 5]: MICROSERVICES DEPLOYMENT (n8n Diet + Private WA APIs)
+      # CONSTRAINT: DB runs on strict diet to keep SQLite size under 15-20MB.
       # ==================================================================
       - name: 🚀 Deploy Client Services
         env:
           CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          # The key uses User's Mobile Number for Data Portability
-          N8N_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
+          CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
         run: |
           docker network create prod-net || true
           
@@ -107,11 +102,13 @@ jobs:
           
           docker run -d --name n8n --network prod-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
-            -e N8N_ENCRYPTION_KEY="$N8N_KEY" \
+            -e N8N_ENCRYPTION_KEY="$CLIENT_MOBILE" \
             -e WEBHOOK_URL="https://nexusautomation.dpdns.org" \
             -e DB_SQLITE_VACUUM_ON_STARTUP=true \
-            -e EXECUTIONS_DATA_SAVE_ON_SUCCESS=none \
+            -e EXECUTIONS_DATA_PRUNE=true \
             -e EXECUTIONS_DATA_MAX_AGE=24 \
+            -e EXECUTIONS_DATA_PRUNE_MAX_COUNT=50 \
+            -e EXECUTIONS_DATA_SAVE_ON_SUCCESS=none \
             -e NODE_FUNCTION_ALLOW_BUILTIN=* \
             -e NODE_FUNCTION_ALLOW_EXTERNAL=* \
             n8nio/n8n
@@ -146,7 +143,7 @@ jobs:
               });
           }
 
-          // Internal JSON APIs for n8n Webhooks (No Public HTML UI)
+          // Internal JSON APIs for n8n Webhooks (Private to Docker Network)
           app.get('/api/qr', async (req, res) => {
               if(sock?.user) return res.json({ status: "connected", phone: sock.user.id });
               if(!qrData) return res.json({ status: "generating" });
@@ -183,30 +180,29 @@ jobs:
 
       # ==================================================================
       # [PHASE 6]: STATE SYNC LOOP & AUTO-RESTART
-      # CONSTRAINT: Runs for 5h 50m. Pushes DB and zipped WA Auth to R2 
-      # every 15 minutes and immediately upon graceful shutdown.
+      # CONSTRAINT: SQLite MUST be vacuumed before every upload to minimize size.
       # ==================================================================
       - name: 🔄 R2 Sync & Keep-Alive Loop
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
           
           upload_state() {
-              echo "Backing up state to R2 ($CLIENT_ID)..."
-              # 1. Vacuum and Upload SQLite
+              echo "Backing up state to R2 ($CLIENT_MOBILE)..."
+              # 1. Vacuum and Upload SQLite (Keeps file size tiny)
               sqlite3 n8n_data/database.sqlite 'VACUUM;' || true
-              aws s3 cp n8n_data/database.sqlite s3://$BUCKET/$CLIENT_ID/database.sqlite --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
+              aws s3 cp n8n_data/database.sqlite s3://$BUCKET/$CLIENT_MOBILE/database.sqlite --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
               
               # 2. Zip and Upload WA Session
               if [ -d "whatsapp/auth_info_baileys" ]; then
                 cd whatsapp && zip -r ../wa_auth.zip auth_info_baileys/ >/dev/null 2>&1 && cd ..
-                aws s3 cp wa_auth.zip s3://$BUCKET/$CLIENT_ID/wa_auth.zip --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
+                aws s3 cp wa_auth.zip s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
               fi
           }
 
