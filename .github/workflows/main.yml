@@ -19,7 +19,6 @@ jobs:
 
       # ==================================================================
       # [PHASE 1]: SYSTEM TUNING & AWS CLI v2
-      # CONSTRAINT: Free runner has only 7GB RAM. 4GB Swap is strictly required.
       # ==================================================================
       - name: ⚙️ Provision Virtual Environment
         run: |
@@ -39,7 +38,6 @@ jobs:
 
       # ==================================================================
       # [PHASE 2]: ZERO-DOWNTIME HANDOVER (Isolated per Client Repo)
-      # CONSTRAINT: Cancels ONLY the previous runs of THIS specific client repo.
       # ==================================================================
       - name: 🤝 Execute Stateful Handover
         env:
@@ -56,7 +54,6 @@ jobs:
 
       # ==================================================================
       # [PHASE 3]: CLOUDFLARE R2 SYNC (Download State)
-      # CONSTRAINT: Folder name is based on CLIENT_MOBILE for easy identification.
       # ==================================================================
       - name: ☁️ Download State from Cloudflare R2
         env:
@@ -69,10 +66,8 @@ jobs:
         run: |
           echo "Pulling Client Data from R2 Storage: $CLIENT_MOBILE"
           
-          # 1. Download n8n Database
           aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/database.sqlite n8n_data/database.sqlite --endpoint-url $R2_ENDPOINT || echo "Fresh n8n deployment."
           
-          # 2. Download WhatsApp Session (Local Auth ZIP)
           aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip wa_auth.zip --endpoint-url $R2_ENDPOINT || echo "No existing WA session."
           if [ -f wa_auth.zip ]; then
             unzip wa_auth.zip -d whatsapp/ || true
@@ -83,8 +78,6 @@ jobs:
 
       # ==================================================================
       # [PHASE 4]: COMMUNITY EXTENSIONS
-      # CONSTRAINT: Must use --legacy-peer-deps to prevent isolated-vm C++ 
-      # build crash on GitHub's Node 20 environment.
       # ==================================================================
       - name: 🧩 Configure Community Extensions
         run: |
@@ -96,8 +89,7 @@ jobs:
           sudo chmod -R 777 n8n_data
 
       # ==================================================================
-      # [PHASE 5]: MICROSERVICES DEPLOYMENT (n8n Diet + Private WA APIs)
-      # CONSTRAINT: DB runs on strict diet to keep SQLite size tiny.
+      # [PHASE 5]: MICROSERVICES DEPLOYMENT
       # ==================================================================
       - name: 🚀 Deploy Client Services
         env:
@@ -152,7 +144,6 @@ jobs:
               });
           }
 
-          // Internal JSON APIs for n8n Webhooks (Private to Docker Network)
           app.get('/api/qr', async (req, res) => {
               if(sock?.user) return res.json({ status: "connected", phone: sock.user.id });
               if(!qrData) return res.json({ status: "generating" });
@@ -179,17 +170,17 @@ jobs:
           app.listen(PORT, start);
           EOF
 
-          docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "npm install @whiskeysockets/baileys axios express qrcode pino"
+          # [FIX APPLIED HERE]: Added git, python3, make, and g++ for Alpine to allow npm install of Baileys
+          docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git python3 make g++ libc6-compat && npm install @whiskeysockets/baileys axios express qrcode pino"
 
-          # Caddy Iron Wall: Blocks external internet from accessing WA /api directly
           printf ":80 {\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
           docker run -d --name caddy --network prod-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
           
-          docker run -d --name wa-bot --network prod-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "node index.js"
+          # Added ffmpeg for media support in Baileys
+          docker run -d --name wa-bot --network prod-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
 
       # ==================================================================
       # [PHASE 6]: STATE SYNC LOOP & AUTO-RESTART
-      # CONSTRAINT: SQLite MUST be vacuumed before every upload to minimize size.
       # ==================================================================
       - name: 🔄 R2 Sync & Keep-Alive Loop
         env:
@@ -204,11 +195,9 @@ jobs:
           
           upload_state() {
               echo "Backing up state to R2 ($CLIENT_MOBILE)..."
-              # 1. Vacuum and Upload SQLite (Keeps file size tiny)
               sqlite3 n8n_data/database.sqlite 'VACUUM;' || true
               aws s3 cp n8n_data/database.sqlite s3://$BUCKET/$CLIENT_MOBILE/database.sqlite --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
               
-              # 2. Zip and Upload WA Session
               if [ -d "whatsapp/auth_info_baileys" ]; then
                 cd whatsapp && zip -r ../wa_auth.zip auth_info_baileys/ >/dev/null 2>&1 && cd ..
                 aws s3 cp wa_auth.zip s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
@@ -230,7 +219,6 @@ jobs:
           while true; do
               NOW=$(date +%s); DIFF=$((NOW - START))
               
-              # Enforce rolling update at 5h 50m (21000 seconds)
               if [ $DIFF -ge 21000 ]; then
                   echo "TTL Threshold Reached. Triggering Next Runner..."
                   gh workflow run main.yml
@@ -238,7 +226,6 @@ jobs:
                   exit 0
               fi
               
-              # Routine State Backup (Every 15 mins)
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
                   upload_state
               fi
