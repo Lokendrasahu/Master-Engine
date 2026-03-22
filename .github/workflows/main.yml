@@ -29,11 +29,16 @@ jobs:
           key: nexus-nodes-cache-${{ runner.os }}
 
       # ==================================================================
-      # [PHASE 2]: PRE-FLIGHT PREPARATION (The Mastermind Logic)
-      # OPTIMIZATION: All heavy downloads and C++ compilations happen HERE,
-      # completely BEFORE the handover. Zero downtime guaranteed.
+      # [PHASE 2]: PRE-FLIGHT PREPARATION & COMMUNITY NODES SYNC
       # ==================================================================
       - name: 🐋 Pre-flight Setup & Dependency Compilation
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+          CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
         run: |
           sudo fallocate -l 4G /swapfile || true && sudo chmod 600 /swapfile || true && sudo mkswap /swapfile || true && sudo swapon /swapfile || true
           sudo sysctl -w net.core.default_qdisc=fq && sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
@@ -54,7 +59,6 @@ jobs:
           echo "Preparing microservice directories..."
           mkdir -p whatsapp public n8n_data/nodes
           
-          # 1. Prepare WhatsApp Bot Code & Package
           cat << 'EOF' > whatsapp/index.js
           const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
           const express = require('express'); const axios = require('axios'); const QRCode = require('qrcode'); const pino = require('pino');
@@ -113,20 +117,24 @@ jobs:
           
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"latest","axios":"latest","express":"latest","qrcode":"latest","pino":"latest"}}' > whatsapp/package.json
           
-          # 2. Pre-compile Alpine binaries for Baileys BEFORE Handover
           echo "Compiling WhatsApp Node Modules..."
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git python3 make g++ libc6-compat ffmpeg tzdata && npm install"
           
-          # 3. Pre-install n8n community nodes BEFORE Handover
-          echo "Provisioning persistent community nodes..."
+          # [JUGAD]: Download custom UI nodes list from R2 BEFORE handover
+          echo "Restoring custom n8n community nodes..."
+          aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/nodes_package.json n8n_data/nodes/package.json --endpoint-url $R2_ENDPOINT >/dev/null 2>&1 || true
+          
           cd n8n_data/nodes
-          if [ ! -f package.json ]; then npm init -y; fi
-          npm install n8n-nodes-unlimited-fallback-agent --legacy-peer-deps --no-fund --no-audit
+          if [ -f package.json ]; then 
+            echo "Installing user's saved community nodes..."
+            npm install --legacy-peer-deps --no-fund --no-audit
+          else
+            echo "No custom community nodes to restore."
+          fi
           cd ../..
 
       # ==================================================================
       # [PHASE 3]: ZERO-DOWNTIME ROLLING UPDATE PROTOCOL
-      # OPTIMIZATION: Safe Handover. The new environment is fully built.
       # ==================================================================
       - name: 🤝 Execute Stateful Handover
         env:
@@ -153,7 +161,7 @@ jobs:
           fi
 
       # ==================================================================
-      # [PHASE 4]: CLOUDFLARE R2 SYNC (Download State)
+      # [PHASE 4]: CLOUDFLARE R2 SYNC (Download Live Database)
       # ==================================================================
       - name: ☁️ Download State from Cloudflare R2
         env:
@@ -178,7 +186,6 @@ jobs:
 
       # ==================================================================
       # [PHASE 5]: FLASH BOOT (Microservices Deployment)
-      # OPTIMIZATION: All dependencies exist. Containers boot in < 2 seconds.
       # ==================================================================
       - name: 🚀 Flash Boot Client Services
         env:
@@ -238,6 +245,11 @@ jobs:
               if [ -d "whatsapp/auth_info_baileys" ]; then
                 cd whatsapp && zip -r ../wa_auth.zip auth_info_baileys/ >/dev/null 2>&1 && cd ..
                 aws s3 cp wa_auth.zip s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
+              fi
+              
+              # Backup Custom Community Nodes List (so it survives restarts)
+              if [ -f "n8n_data/nodes/package.json" ]; then
+                aws s3 cp n8n_data/nodes/package.json s3://$BUCKET/$CLIENT_MOBILE/nodes_package.json --endpoint-url $R2_ENDPOINT >/dev/null 2>&1 || true
               fi
           }
 
