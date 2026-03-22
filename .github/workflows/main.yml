@@ -18,42 +18,67 @@ jobs:
         uses: actions/checkout@v4
 
       # ==================================================================
-      # [PHASE 1]: SYSTEM TUNING & AWS CLI v2
+      # [PHASE 1]: DEPENDENCY CACHING (Optimizes Pipeline Speed)
+      # ==================================================================
+      - name: 📦 Restore Module Cache
+        uses: actions/cache@v4
+        with:
+          path: n8n_data/nodes
+          key: nexus-nodes-cache-${{ runner.os }}
+
+      # ==================================================================
+      # [PHASE 1.5]: SYSTEM TUNING, AWS CLI & DOCKER PRE-FETCH
       # ==================================================================
       - name: ⚙️ Provision Virtual Environment
         run: |
           sudo fallocate -l 4G /swapfile || true && sudo chmod 600 /swapfile || true && sudo mkswap /swapfile || true && sudo swapon /swapfile || true
           sudo sysctl -w net.core.default_qdisc=fq && sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
           
-          # Basic utilities
           sudo apt-get update -qq && sudo apt-get install -y sqlite3 curl zip unzip jq
           
-          # Official AWS CLI v2 Installation (Fixes apt-get missing package error)
           echo "Installing AWS CLI v2..."
           curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip -q awscliv2.zip
           sudo ./aws/install --update
           
+          docker pull cloudflare/cloudflared:latest &
+          docker pull n8nio/n8n:latest &
+          docker pull caddy:latest &
+          docker pull node:20-alpine &
+          
           mkdir -p whatsapp public n8n_data/nodes n8n_data/node_modules
 
       # ==================================================================
-      # [PHASE 2]: ZERO-DOWNTIME HANDOVER (Isolated per Client Repo)
+      # [PHASE 2]: ZERO-DOWNTIME ROLLING UPDATE PROTOCOL
+      # OPTIMIZATION: Smart polling replaces fixed sleep. Transfers state in seconds.
       # ==================================================================
       - name: 🤝 Execute Stateful Handover
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          echo "Scanning for previous deployments in this client repository..."
-          OLD_RUN=$(gh run list --workflow="main.yml" --json databaseId,status -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting"))] | .[0]?.databaseId')
+          echo "Scanning for previous deployment state..."
+          OLD_RUN=$(gh run list --workflow="main.yml" --json databaseId,status -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested"))] | .[0]?.databaseId')
           
           if [ -n "$OLD_RUN" ] && [ "$OLD_RUN" != "null" ]; then
-            echo "Previous instance ($OLD_RUN) detected. Sending termination signal..."
+            echo "Previous deployment detected (ID: $OLD_RUN). Initiating graceful state transfer..."
             gh run cancel $OLD_RUN
-            sleep 15 # Wait for the old runner to upload its final state to R2
+            
+            echo "Awaiting state synchronization completion (Max timeout 3m)..."
+            for i in {1..36}; do
+              STATUS=$(gh run view $OLD_RUN --json status -q '.status' 2>/dev/null || echo "completed")
+              if [ "$STATUS" != "in_progress" ] && [ "$STATUS" != "queued" ] && [ "$STATUS" != "waiting" ]; then 
+                echo "State transfer successful. Terminating legacy instance."
+                break
+              fi
+              sleep 5
+            done
+          else
+            echo "No active deployments found. Initializing primary boot sequence."
           fi
 
       # ==================================================================
       # [PHASE 3]: CLOUDFLARE R2 SYNC (Download State)
+      # CONSTRAINT: No hardcoded buckets. All parameters fetched from secrets.
       # ==================================================================
       - name: ☁️ Download State from Cloudflare R2
         env:
@@ -82,19 +107,24 @@ jobs:
       - name: 🧩 Configure Community Extensions
         run: |
           cd n8n_data/nodes
-          [ ! -f package.json ] && npm init -y
-          echo "Installing n8n-nodes-unlimited-fallback-agent..."
-          npm install n8n-nodes-unlimited-fallback-agent --legacy-peer-deps --no-fund --no-audit
+          if [ ! -f package.json ]; then
+            npm init -y
+            echo "Installing n8n community nodes..."
+            npm install n8n-nodes-unlimited-fallback-agent --legacy-peer-deps --no-fund --no-audit
+          else
+            echo "Community nodes restored from cache. Skipping installation."
+          fi
           cd ../..
           sudo chmod -R 777 n8n_data
 
       # ==================================================================
-      # [PHASE 5]: MICROSERVICES DEPLOYMENT
+      # [PHASE 5]: MICROSERVICES DEPLOYMENT (Dynamic Domain & Strict DB Diet)
       # ==================================================================
       - name: 🚀 Deploy Client Services
         env:
           CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
+          CLIENT_DOMAIN: ${{ secrets.CLIENT_DOMAIN }}
         run: |
           docker network create prod-net || true
           
@@ -104,12 +134,16 @@ jobs:
           docker run -d --name n8n --network prod-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
             -e N8N_ENCRYPTION_KEY="$CLIENT_MOBILE" \
-            -e WEBHOOK_URL="https://nexusautomation.dpdns.org" \
+            -e WEBHOOK_URL="https://$CLIENT_DOMAIN" \
+            -e NODE_OPTIONS="--max-old-space-size=2048" \
             -e DB_SQLITE_VACUUM_ON_STARTUP=true \
             -e EXECUTIONS_DATA_PRUNE=true \
             -e EXECUTIONS_DATA_MAX_AGE=24 \
             -e EXECUTIONS_DATA_PRUNE_MAX_COUNT=50 \
             -e EXECUTIONS_DATA_SAVE_ON_SUCCESS=none \
+            -e N8N_WORKFLOW_HISTORY_ENABLED=false \
+            -e N8N_DIAGNOSTICS_ENABLED=false \
+            -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
             -e NODE_FUNCTION_ALLOW_BUILTIN=* \
             -e NODE_FUNCTION_ALLOW_EXTERNAL=* \
             n8nio/n8n
@@ -170,17 +204,15 @@ jobs:
           app.listen(PORT, start);
           EOF
 
-          # [FIX APPLIED HERE]: Added git, python3, make, and g++ for Alpine to allow npm install of Baileys
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git python3 make g++ libc6-compat && npm install @whiskeysockets/baileys axios express qrcode pino"
 
           printf ":80 {\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
           docker run -d --name caddy --network prod-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
           
-          # Added ffmpeg for media support in Baileys
           docker run -d --name wa-bot --network prod-net --restart unless-stopped -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
 
       # ==================================================================
-      # [PHASE 6]: STATE SYNC LOOP & AUTO-RESTART
+      # [PHASE 6]: STATE SYNC LOOP & SELF-HEALING MONITORS
       # ==================================================================
       - name: 🔄 R2 Sync & Keep-Alive Loop
         env:
@@ -206,8 +238,12 @@ jobs:
 
           cleanup() {
               [ -f /tmp/sync_lock ] && exit 0; touch /tmp/sync_lock
-              echo "🛑 Pre-emption Signal Caught. Uploading final state..."
+              echo "🛑 Pre-emption Signal Caught. Securing State..."
+              
+              # Fast kill of external ingress to prevent new messages during backup
+              docker kill cloudflared wa-bot || true
               docker stop -t 3 n8n || true
+              
               upload_state
               exit 0
           }
@@ -222,9 +258,14 @@ jobs:
               if [ $DIFF -ge 21000 ]; then
                   echo "TTL Threshold Reached. Triggering Next Runner..."
                   gh workflow run main.yml
-                  for i in {1..12}; do sleep 5; done 
+                  for i in {1..60}; do sleep 5; done 
                   exit 0
               fi
+              
+              # Self-Healing Guards
+              if ! docker ps | grep -q wa-bot; then docker restart wa-bot > /dev/null; fi
+              if ! docker ps | grep -q n8n; then docker restart n8n > /dev/null; fi
+              if ! docker ps | grep -q cloudflared; then docker restart cloudflared > /dev/null; fi
               
               if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
                   upload_state
