@@ -210,7 +210,8 @@ jobs:
             -e WEBHOOK_URL="https://$CLIENT_DOMAIN" \
             -e GENERIC_TIMEZONE="Asia/Kolkata" \
             -e TZ="Asia/Kolkata" \
-            -e NODE_OPTIONS="--max-old-space-size=2048" \
+            -e NODE_OPTIONS="--max-old-space-size=8192" \
+            -e UV_THREADPOOL_SIZE=8 \
             -e N8N_BLOCK_ENV_ACCESS_IN_NODE=true \
             -e N8N_HIDE_USAGE_PAGE=true \
             -e N8N_TEMPLATES_ENABLED=false \
