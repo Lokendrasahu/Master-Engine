@@ -192,6 +192,7 @@ jobs:
           CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
           CLIENT_DOMAIN: ${{ secrets.CLIENT_DOMAIN }}
+          N8N_ENCRYPTION_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
         run: |
           docker network create prod-net || true
           
@@ -204,7 +205,8 @@ jobs:
           
           docker run -d --name n8n --network prod-net --restart unless-stopped \
             -v $(pwd)/n8n_data:/home/node/.n8n \
-            -e N8N_ENCRYPTION_KEY="$CLIENT_MOBILE" \
+            -e NODE_PATH="/home/node/.n8n/nodes/node_modules" \
+            -e N8N_ENCRYPTION_KEY="$N8N_ENCRYPTION_KEY" \
             -e WEBHOOK_URL="https://$CLIENT_DOMAIN" \
             -e NODE_OPTIONS="--max-old-space-size=2048" \
             -e DB_SQLITE_VACUUM_ON_STARTUP=true \
