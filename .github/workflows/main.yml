@@ -160,6 +160,9 @@ jobs:
 
           docker network create prod-net || true
 
+          # Clean stale containers from this runner, if any.
+          docker rm -f n8n caddy cloudflared >/dev/null 2>&1 || true
+
           cat > Caddyfile <<'EOF'
           :80 {
               reverse_proxy /* n8n:5678
@@ -191,7 +194,7 @@ jobs:
             -v "$(pwd)/n8n_data:/home/node/.n8n" \
             -e NODE_PATH="/home/node/.n8n/nodes/node_modules" \
             -e N8N_ENCRYPTION_KEY="$N8N_ENCRYPTION_KEY" \
-            -e WEBHOOK_URL="https://$CLIENT_DOMAIN" \
+            -e N8N_WEBHOOK_URL="https://$CLIENT_DOMAIN" \
             -e GENERIC_TIMEZONE="Asia/Kolkata" \
             -e TZ="Asia/Kolkata" \
             -e NODE_OPTIONS="--max-old-space-size=8192" \
@@ -216,16 +219,23 @@ jobs:
             -e NODE_FUNCTION_ALLOW_EXTERNAL=* \
             n8nio/n8n:latest
 
-          echo "Waiting for n8n..."
-          for i in {1..30}; do
-            if curl -fsS "http://127.0.0.1:5678/healthz" >/dev/null 2>&1; then
+          echo "Waiting for n8n migrations and startup..."
+          for i in {1..150}; do
+            if docker exec n8n node -e "
+              fetch('http://127.0.0.1:5678/healthz')
+                .then(r => process.exit(r.ok ? 0 : 1))
+                .catch(() => process.exit(1))
+            " >/dev/null 2>&1; then
               echo "n8n is healthy."
               break
             fi
 
-            if [ "$i" -eq 30 ]; then
-              echo "n8n failed health check."
-              docker logs n8n --tail 100
+            if [ "$i" -eq 150 ]; then
+              echo "n8n failed health check after 5 minutes."
+              echo "Container status:"
+              docker ps -a --filter "name=n8n"
+              echo "Last n8n logs:"
+              docker logs n8n --tail 150
               exit 1
             fi
 
