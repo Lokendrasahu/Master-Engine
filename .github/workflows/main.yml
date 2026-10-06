@@ -205,6 +205,7 @@ jobs:
             -e N8N_PERSONALIZATION_ENABLED=false \
             -e N8N_ONBOARDING_FLOW_DISABLED=true \
             -e N8N_LOG_LEVEL=warn \
+            -e N8N_HIDE_PRODUCTION_CHECKLIST=true \
             -e N8N_HIRING_BANNER_ENABLED=false \
             -e EXECUTIONS_DATA_PRUNE=true \
             -e EXECUTIONS_DATA_MAX_AGE=24 \
