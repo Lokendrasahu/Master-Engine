@@ -1,3 +1,4 @@
+
 name: "Nexus SaaS: Client Engine"
 
 on:
@@ -14,22 +15,22 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ==================================================================
-      # [PHASE 1]: CHECKOUT & CACHE
-      # ==================================================================
-      - name: "📥 Checkout Repository"
+      # ================================================================
+      # PHASE 1: CHECKOUT AND CACHE
+      # ================================================================
+      - name: "Checkout Repository"
         uses: actions/checkout@v4
 
-      - name: "📦 Restore n8n Community Node Cache"
+      - name: "Restore Community Node Cache"
         uses: actions/cache@v4
         with:
           path: n8n_data/nodes
           key: nexus-nodes-cache-${{ runner.os }}
 
-      # ==================================================================
-      # [PHASE 2]: PRE-FLIGHT
-      # ==================================================================
-      - name: "🐋 Pre-flight Setup"
+      # ================================================================
+      # PHASE 2: PRE-FLIGHT
+      # ================================================================
+      - name: "Pre-flight Setup"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -38,60 +39,57 @@ jobs:
           BUCKET: ${{ secrets.R2_BUCKET_NAME }}
           CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
         run: |
-          set -e
+          set -euo pipefail
 
           sudo fallocate -l 4G /swapfile || true
           sudo chmod 600 /swapfile || true
           sudo mkswap /swapfile || true
           sudo swapon /swapfile || true
 
-          sudo sysctl -w net.core.default_qdisc=fq
-          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
 
           sudo apt-get update -qq
           sudo apt-get install -y sqlite3 curl jq unzip
 
-          echo "Installing AWS CLI v2..."
-          curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+          curl -fsSL \
+            "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+            -o awscliv2.zip
+
           unzip -q awscliv2.zip
           sudo ./aws/install --update
           rm -rf aws awscliv2.zip
 
-          echo "Pulling required Docker images..."
           docker pull cloudflare/cloudflared:latest
           docker pull n8nio/n8n:latest
           docker pull caddy:latest
 
-          echo "Preparing n8n directories..."
           mkdir -p n8n_data/nodes
 
-          # Restore custom n8n community nodes
-          echo "Restoring custom n8n community nodes..."
+          echo "Restoring community node package..."
           aws s3 cp \
             "s3://$BUCKET/$CLIENT_MOBILE/nodes_package.json" \
             "n8n_data/nodes/package.json" \
             --endpoint-url "$R2_ENDPOINT" \
             >/dev/null 2>&1 || true
 
-          cd n8n_data/nodes
-          if [ -f package.json ]; then
-            echo "Installing saved community nodes..."
+          if [ -f n8n_data/nodes/package.json ]; then
+            cd n8n_data/nodes
             npm install --legacy-peer-deps --no-fund --no-audit
-          else
-            echo "No custom community nodes to restore."
+            cd ../..
           fi
-          cd ../..
 
-      # ==================================================================
-      # [PHASE 3]: STATEFUL HANDOVER
-      # ==================================================================
-      - name: "🤝 Execute Stateful Handover"
+      # ================================================================
+      # PHASE 3: SAFE HANDOVER
+      # Never cancel the old runner to make room for the new one.
+      # ================================================================
+      - name: "Safe Stateful Handover"
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "Scanning for previous deployment state..."
+          echo "Looking for an older active deployment..."
 
           OLD_RUN=$(gh run list \
             --workflow="main.yml" \
@@ -99,31 +97,43 @@ jobs:
             -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested"))] | .[0]?.databaseId')
 
           if [ -n "$OLD_RUN" ] && [ "$OLD_RUN" != "null" ]; then
-            echo "Previous deployment detected: $OLD_RUN"
-            gh run cancel "$OLD_RUN" || true
+            echo "Previous run: $OLD_RUN"
+            echo "Waiting for the old runner to stop after its final backup."
+            echo "The old runner will NOT be cancelled by this workflow."
 
-            echo "Waiting for old runner to release state..."
-            for i in {1..36}; do
-              STATUS=$(gh run view "$OLD_RUN" --json status -q '.status' 2>/dev/null || echo "completed")
+            while true; do
+              STATUS=$(gh run view "$OLD_RUN" \
+                --json status -q '.status' 2>/dev/null || echo "unknown")
 
-              if [ "$STATUS" != "in_progress" ] &&
-                 [ "$STATUS" != "queued" ] &&
-                 [ "$STATUS" != "waiting" ] &&
-                 [ "$STATUS" != "requested" ]; then
-                echo "Previous runner stopped."
-                break
-              fi
-
-              sleep 5
+              case "$STATUS" in
+                completed)
+                  break
+                  ;;
+                *)
+                  sleep 10
+                  ;;
+              esac
             done
+
+            CONCLUSION=$(gh run view "$OLD_RUN" \
+              --json conclusion -q '.conclusion' 2>/dev/null || echo "unknown")
+
+            if [ "$CONCLUSION" != "success" ]; then
+              echo "ERROR: Previous run ended as '$CONCLUSION'."
+              echo "Safe handover refused because final backup is unconfirmed."
+              exit 1
+            fi
+
+            echo "Previous runner completed successfully."
           else
-            echo "No active previous deployment found."
+            echo "No older active run found."
           fi
 
-      # ==================================================================
-      # [PHASE 4]: RESTORE n8n STATE FROM R2
-      # ==================================================================
-      - name: "☁️ Download n8n State from R2"
+      # ================================================================
+      # PHASE 4: RESTORE AND VALIDATE DATABASE
+      # Never silently create a blank database.
+      # ================================================================
+      - name: "Restore n8n Database from R2"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -132,35 +142,65 @@ jobs:
           BUCKET: ${{ secrets.R2_BUCKET_NAME }}
           CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "Pulling n8n database for client: $CLIENT_MOBILE"
+          DB_KEY="$CLIENT_MOBILE/database.sqlite"
+          DB_URL="s3://$BUCKET/$DB_KEY"
 
-          if aws s3 cp \
-            "s3://$BUCKET/$CLIENT_MOBILE/database.sqlite" \
-            "n8n_data/database.sqlite" \
-            --endpoint-url "$R2_ENDPOINT"; then
-            echo "Database restored."
-          else
-            echo "No existing database found. Starting fresh."
+          echo "Checking R2 database object..."
+
+          if ! aws s3api head-object \
+            --bucket "$BUCKET" \
+            --key "$DB_KEY" \
+            --endpoint-url "$R2_ENDPOINT" >/dev/null; then
+            echo "FATAL: R2 database is missing or inaccessible."
+            echo "Refusing to launch n8n with an empty database."
+            exit 1
           fi
 
+          RESTORED=0
+
+          for attempt in 1 2 3; do
+            rm -f n8n_data/database.sqlite
+
+            if aws s3 cp "$DB_URL" \
+              n8n_data/database.sqlite \
+              --endpoint-url "$R2_ENDPOINT"; then
+
+              if [ -s n8n_data/database.sqlite ] &&
+                 sqlite3 n8n_data/database.sqlite \
+                   'PRAGMA quick_check;' | grep -qx 'ok'; then
+                RESTORED=1
+                break
+              fi
+
+              echo "Downloaded database failed integrity validation."
+            fi
+
+            echo "Restore attempt $attempt/3 failed; retrying..."
+            sleep 10
+          done
+
+          if [ "$RESTORED" -ne 1 ]; then
+            echo "FATAL: Could not restore a valid SQLite database."
+            exit 1
+          fi
+
+          echo "Database restored and validated."
           sudo chmod -R 777 n8n_data
 
-      # ==================================================================
-      # [PHASE 5]: DEPLOYMENT
-      # ==================================================================
-      - name: "🚀 Start n8n Services"
+      # ================================================================
+      # PHASE 5: START SERVICES
+      # ================================================================
+      - name: "Start n8n Services"
         env:
           CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           CLIENT_DOMAIN: ${{ secrets.CLIENT_DOMAIN }}
           N8N_ENCRYPTION_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
         run: |
-          set -e
+          set -euo pipefail
 
           docker network create prod-net || true
-
-          # Clean stale containers from this runner, if any.
           docker rm -f n8n caddy cloudflared >/dev/null 2>&1 || true
 
           cat > Caddyfile <<'EOF'
@@ -169,7 +209,6 @@ jobs:
           }
           EOF
 
-          echo "Starting Cloudflare Tunnel..."
           docker run -d \
             --name cloudflared \
             --network host \
@@ -177,7 +216,6 @@ jobs:
             cloudflare/cloudflared:latest \
             tunnel --no-autoupdate run --token "$CF_TOKEN"
 
-          echo "Starting Caddy..."
           docker run -d \
             --name caddy \
             --network prod-net \
@@ -186,7 +224,6 @@ jobs:
             -v "$(pwd)/Caddyfile:/etc/caddy/Caddyfile:ro" \
             caddy:latest
 
-          echo "Starting n8n..."
           docker run -d \
             --name n8n \
             --network prod-net \
@@ -200,7 +237,7 @@ jobs:
             -e NODE_OPTIONS="--max-old-space-size=8192" \
             -e UV_THREADPOOL_SIZE=8 \
             -e N8N_BLOCK_ENV_ACCESS_IN_NODE=true \
-            -e N8N_HIDE_USAGE_PAGE=true \
+            -e N8N_HIDE_USAGE_PAGE=false \
             -e N8N_TEMPLATES_ENABLED=false \
             -e N8N_PERSONALIZATION_ENABLED=false \
             -e N8N_ONBOARDING_FLOW_DISABLED=true \
@@ -220,33 +257,34 @@ jobs:
             -e NODE_FUNCTION_ALLOW_EXTERNAL=* \
             n8nio/n8n:latest
 
-          echo "Waiting for n8n migrations and startup..."
+          echo "Waiting for n8n health check..."
+
+          HEALTHY=0
+
           for i in {1..150}; do
             if docker exec n8n node -e "
               fetch('http://127.0.0.1:5678/healthz')
                 .then(r => process.exit(r.ok ? 0 : 1))
                 .catch(() => process.exit(1))
             " >/dev/null 2>&1; then
-              echo "n8n is healthy."
+              HEALTHY=1
               break
             fi
-
-            if [ "$i" -eq 150 ]; then
-              echo "n8n failed health check after 5 minutes."
-              echo "Container status:"
-              docker ps -a --filter "name=n8n"
-              echo "Last n8n logs:"
-              docker logs n8n --tail 150
-              exit 1
-            fi
-
             sleep 2
           done
 
-      # ==================================================================
-      # [PHASE 6]: R2 BACKUP + KEEP ALIVE
-      # ==================================================================
-      - name: "🔄 R2 Sync & Keep-Alive Loop"
+          if [ "$HEALTHY" -ne 1 ]; then
+            docker ps -a
+            docker logs n8n --tail 150
+            exit 1
+          fi
+
+          echo "n8n is healthy."
+
+      # ================================================================
+      # PHASE 6: VERIFIED R2 BACKUP + RUNNER ROTATION
+      # ================================================================
+      - name: "R2 Sync and Keep Alive"
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
@@ -256,74 +294,137 @@ jobs:
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          set +e
+          set -uo pipefail
 
           upload_state() {
-            echo "Backing up n8n state to R2 ($CLIENT_MOBILE)..."
+            echo "Starting SQLite backup to R2..."
 
-            if [ -f "n8n_data/database.sqlite" ]; then
-              # Checkpoint WAL only. Do NOT VACUUM while n8n is live.
-              sqlite3 n8n_data/database.sqlite \
-                'PRAGMA wal_checkpoint(TRUNCATE);' \
-                >/dev/null 2>&1 || true
-
-              aws s3 cp \
-                "n8n_data/database.sqlite" \
-                "s3://$BUCKET/$CLIENT_MOBILE/database.sqlite" \
-                --endpoint-url "$R2_ENDPOINT" \
-                >/dev/null 2>&1 \
-                || echo "⚠️ SQLite R2 Sync Failed"
-            else
-              echo "⚠️ database.sqlite not found; skipping backup."
+            if [ ! -s n8n_data/database.sqlite ]; then
+              echo "ERROR: Local database is missing or empty."
+              return 1
             fi
 
-            if [ -f "n8n_data/nodes/package.json" ]; then
+            # Checkpoint WAL before copying the SQLite database.
+            sqlite3 n8n_data/database.sqlite \
+              'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null 2>&1 || true
+
+            if ! sqlite3 n8n_data/database.sqlite \
+              'PRAGMA quick_check;' | grep -qx 'ok'; then
+              echo "ERROR: SQLite integrity check failed; backup refused."
+              return 1
+            fi
+
+            LOCAL_SIZE=$(stat -c %s n8n_data/database.sqlite 2>/dev/null || echo 0)
+
+            if [ "$LOCAL_SIZE" -le 0 ]; then
+              echo "ERROR: Local database size is zero."
+              return 1
+            fi
+
+            if ! aws s3 cp \
+              n8n_data/database.sqlite \
+              "s3://$BUCKET/$CLIENT_MOBILE/database.sqlite" \
+              --endpoint-url "$R2_ENDPOINT"; then
+              echo "ERROR: Upload to R2 failed."
+              return 1
+            fi
+
+            REMOTE_SIZE=$(aws s3api head-object \
+              --bucket "$BUCKET" \
+              --key "$CLIENT_MOBILE/database.sqlite" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --query ContentLength \
+              --output text 2>/dev/null || echo 0)
+
+            if [ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]; then
+              echo "ERROR: Size verification failed."
+              echo "Local=$LOCAL_SIZE bytes; R2=$REMOTE_SIZE bytes."
+              return 1
+            fi
+
+            echo "SUCCESS: R2 database size verified: $REMOTE_SIZE bytes."
+
+            if [ -f n8n_data/nodes/package.json ]; then
               aws s3 cp \
-                "n8n_data/nodes/package.json" \
+                n8n_data/nodes/package.json \
                 "s3://$BUCKET/$CLIENT_MOBILE/nodes_package.json" \
                 --endpoint-url "$R2_ENDPOINT" \
-                >/dev/null 2>&1 \
-                || echo "⚠️ Community node package R2 Sync Failed"
+                || echo "WARNING: Community node package backup failed."
             fi
+
+            return 0
           }
 
           cleanup() {
-            [ -f /tmp/sync_lock ] && exit 0
-            touch /tmp/sync_lock
+            if [ "${CLEANUP_STARTED:-0}" = "1" ]; then
+              return
+            fi
+            CLEANUP_STARTED=1
+            trap - SIGINT SIGTERM SIGHUP
 
-            echo "🛑 Shutdown signal received. Securing n8n state..."
+            echo "Stopping services for safe handover..."
 
-            docker stop -t 10 n8n >/dev/null 2>&1 || true
+            docker stop -t 20 n8n >/dev/null 2>&1 || true
             docker stop -t 10 caddy >/dev/null 2>&1 || true
             docker stop -t 10 cloudflared >/dev/null 2>&1 || true
 
-            # Final backup after n8n is stopped.
-            upload_state
+            BACKUP_OK=0
 
-            exit 0
+            for attempt in 1 2 3 4 5; do
+              if upload_state; then
+                BACKUP_OK=1
+                break
+              fi
+
+              echo "Final backup attempt $attempt/5 failed."
+              sleep 15
+            done
+
+            if [ "$BACKUP_OK" -ne 1 ]; then
+              echo "FATAL: Final R2 backup could not be verified."
+              return 1
+            fi
+
+            echo "Final R2 backup verified."
+            return 0
           }
 
-          trap 'cleanup' SIGINT SIGTERM SIGHUP
+          trap 'cleanup || exit 1' SIGINT SIGTERM SIGHUP
 
           START=$(date +%s)
+          ROTATE_AFTER=19800
+          LAST_BACKUP=0
+          BACKUP_INTERVAL=900
 
           while true; do
             NOW=$(date +%s)
             DIFF=$((NOW - START))
 
-            # Rotate before GitHub's runner limit.
-            if [ "$DIFF" -ge 21000 ]; then
-              echo "TTL threshold reached. Triggering next runner..."
+            # Rotate at 5h30m, before GitHub's 6-hour hard limit.
+            if [ "$DIFF" -ge "$ROTATE_AFTER" ]; then
+              echo "Rotation threshold reached."
 
-              gh workflow run main.yml >/dev/null 2>&1 || \
-                echo "⚠️ Failed to trigger next runner."
+              if ! gh workflow run main.yml; then
+                echo "ERROR: Could not queue the next runner."
+                echo "Keeping the current runner alive and retrying."
+                sleep 60
+                continue
+              fi
 
-              sleep 30
-              cleanup
+              echo "Next runner queued; preparing final verified backup."
+
+              if cleanup; then
+                echo "Safe shutdown finished."
+                exit 0
+              else
+                echo "ERROR: Final backup failed. This run will fail."
+                exit 1
+              fi
             fi
 
-            # Restart services if they unexpectedly die.
+            # Restart crashed containers if Docker still reports them.
             if ! docker ps --format '{{.Names}}' | grep -qx n8n; then
+              echo "WARNING: n8n container stopped; attempting restart."
               docker restart n8n >/dev/null 2>&1 || true
             fi
 
@@ -335,11 +436,14 @@ jobs:
               docker restart cloudflared >/dev/null 2>&1 || true
             fi
 
-            # Backup approximately every 15 minutes.
-            if [ $((DIFF % 900)) -lt 60 ] && [ "$DIFF" -gt 100 ]; then
-              upload_state
-              sleep 65
-            else
-              sleep 5
+            # Backup every 15 minutes.
+            if [ "$((NOW - LAST_BACKUP))" -ge "$BACKUP_INTERVAL" ]; then
+              if upload_state; then
+                LAST_BACKUP=$NOW
+              else
+                echo "WARNING: Periodic backup failed; retrying next loop."
+              fi
             fi
+
+            sleep 10
           done
