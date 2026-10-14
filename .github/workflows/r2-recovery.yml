@@ -4,20 +4,28 @@ name: R2 Database Recovery
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  recover:
+  inspect:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Install AWS CLI v2
         run: |
           set -e
-          curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+          sudo apt-get update -qq
+          sudo apt-get install -y curl unzip jq
+          curl -sS \
+            https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip \
+            -o awscliv2.zip
           unzip -q awscliv2.zip
           sudo ./aws/install --update
           aws --version
 
-
-      - name: List and download database
+      - name: Inspect R2 database and incomplete uploads
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -25,28 +33,67 @@ jobs:
           ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           BUCKET: ${{ secrets.R2_BUCKET_NAME }}
           CLIENT: ${{ secrets.CLIENT_MOBILE }}
+        shell: bash
         run: |
           set -euo pipefail
+
           ENDPOINT="https://${ACCOUNT_ID}.r2.cloudflarestorage.com"
+          KEY="${CLIENT}/database.sqlite"
+
+          echo "=== 1. Check current database object ==="
+
+          if aws s3api head-object \
+            --bucket "$BUCKET" \
+            --key "$KEY" \
+            --endpoint-url "$ENDPOINT" \
+            --query '{Size:ContentLength,Modified:LastModified,ETag:ETag}' \
+            --output json; then
+            echo "Database object exists."
+          else
+            echo "Current database object not accessible."
+          fi
+
+          echo "=== 2. List client objects ==="
 
           aws s3api list-objects-v2 \
             --bucket "$BUCKET" \
-            --prefix "$CLIENT/" \
+            --prefix "${CLIENT}/" \
             --endpoint-url "$ENDPOINT" \
             --query 'Contents[].{Key:Key,Size:Size,Modified:LastModified}' \
-            --output table
+            --output json || true
 
-          aws s3 cp \
-            "s3://${BUCKET}/${CLIENT}/database.sqlite" \
-            recovered-database.sqlite \
-            --endpoint-url "$ENDPOINT"
+          echo "=== 3. Find incomplete multipart uploads ==="
 
-          ls -lh recovered-database.sqlite
-          sha256sum recovered-database.sqlite
+          aws s3api list-multipart-uploads \
+            --bucket "$BUCKET" \
+            --prefix "${CLIENT}/" \
+            --endpoint-url "$ENDPOINT" \
+            --output json > multipart.json
 
-      - name: Save recovery file
-        uses: actions/upload-artifact@v4
-        with:
-          name: n8n-database-recovery
-          path: recovered-database.sqlite
-          retention-days: 7
+          jq --arg key "$KEY" \
+            '[.Uploads[]? | select(.Key == $key)]' \
+            multipart.json > matching.json
+
+          COUNT=$(jq 'length' matching.json)
+          echo "Matching uploads: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No incomplete upload found for database.sqlite."
+          else
+            for i in $(seq 0 $((COUNT - 1))); do
+              UPLOAD_ID=$(jq -r ".[$i].UploadId" matching.json)
+
+              echo "=== Upload $((i + 1)) ==="
+              jq ".[$i] | {Key, UploadId, Initiated}" matching.json
+
+              aws s3api list-parts \
+                --bucket "$BUCKET" \
+                --key "$KEY" \
+                --upload-id "$UPLOAD_ID" \
+                --endpoint-url "$ENDPOINT" \
+                --query 'Parts[].{PartNumber:PartNumber,Size:Size,ETag:ETag}' \
+                --output json
+            done
+          fi
+
+          echo "=== Inspection complete; no objects modified. ==="
