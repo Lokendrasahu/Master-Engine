@@ -1,0 +1,17 @@
+
+name: VPS Runner Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - name: Test VPS
+        run: |
+          echo "Hello from my VPS!"
+          echo "Hostname: $(hostname)"
+          echo "CPU cores: $(nproc)"
+          free -h
+          df -h /
