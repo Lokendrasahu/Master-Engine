@@ -228,10 +228,10 @@ jobs:
 
       # ============================================================
       # 5. OPTIONAL LOCAL GEMINI WEB2API
-      # Failures here must never fail or stop the existing n8n service.
-      # Gemini uses host networking for Gemini upstream compatibility,
-      # but binds ONLY to the prod-net bridge gateway IP.
-      # No public port, Cloudflare route, or API auth is required.
+      # Gemini failure must never prevent n8n startup.
+      # Host networking preserves Gemini upstream compatibility.
+      # API listens ONLY on the private prod-net gateway IP.
+      # No public port mapping or Cloudflare route.
       # ============================================================
       - name: Start Local Gemini Web2API (Optional)
         continue-on-error: true
@@ -242,33 +242,34 @@ jobs:
             echo "::warning::$1"
           }
 
-          # Create the same private bridge n8n will use later.
           docker network create prod-net >/dev/null 2>&1 || true
 
           GEMINI_BIND_IP=$(docker network inspect prod-net \
-            --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+            --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' \
+            2>/dev/null || true)
 
           if [ -z "$GEMINI_BIND_IP" ]; then
-            warn "Gemini skipped: could not determine prod-net gateway. n8n remains running."
+            warn "Gemini skipped: prod-net gateway unavailable. n8n remains unaffected."
             exit 0
           fi
 
-          echo "Gemini API will bind only to $GEMINI_BIND_IP:8081"
-          echo "No public interface or public port mapping will be used."
+          echo "Gemini listening address: $GEMINI_BIND_IP:8081"
+          echo "No public interface or public port mapping."
 
           if ! git clone --depth 1 \
             https://github.com/Sophomoresty/gemini-web2api.git \
             gemini-web2api-source; then
-            warn "Gemini source download failed. n8n remains running."
+            warn "Gemini source download failed. n8n remains unaffected."
             exit 0
           fi
 
-          mkdir -p gemini_runtime || {
-            warn "Could not create Gemini runtime directory. n8n remains running."
+          if ! mkdir -p gemini_runtime; then
+            warn "Gemini runtime directory creation failed."
             exit 0
-          }
+          fi
 
           export GEMINI_BIND_IP
+
           if ! python3 - <<'PYCONFIG'
           import json
           import os
@@ -283,8 +284,6 @@ jobs:
               "auth_user": None,
               "xsrf_token": None,
               "default_model": "gemini-3.6-flash",
-              # Empty list disables proxy auth. The server is bound only
-              # to the private Docker bridge gateway, not a public interface.
               "api_keys": [],
               "cookie_file": None,
               "proxy": None,
@@ -294,71 +293,97 @@ jobs:
 
           with open("gemini_runtime/config.json", "w", encoding="utf-8") as f:
               json.dump(config, f, indent=2)
+
+          print("Gemini configuration generated.")
           PYCONFIG
           then
-            warn "Gemini config generation failed. n8n remains running."
+            warn "Gemini configuration failed. n8n remains unaffected."
             exit 0
           fi
 
           echo "Building Gemini Web2API from source..."
+
           if ! docker build --pull \
             -t gemini-web2api:local \
             ./gemini-web2api-source; then
-            warn "Gemini image build failed. n8n remains running."
+            warn "Gemini Docker build failed. n8n remains unaffected."
             exit 0
           fi
 
-          echo "Starting Gemini API container..."
+          # Only remove the optional Gemini container.
+          docker rm -f gemini-web2api >/dev/null 2>&1 || true
+
+          echo "Starting Gemini container..."
+
           if ! docker run -d \
             --name gemini-web2api \
             --network host \
             --restart unless-stopped \
             -v "$(pwd)/gemini_runtime/config.json:/app/config.json:ro" \
             gemini-web2api:local; then
-            warn "Gemini container could not start. n8n remains running."
+
+            warn "Gemini container failed to start. n8n remains unaffected."
             docker logs gemini-web2api --tail 80 2>/dev/null || true
             exit 0
           fi
 
-          echo "Waiting for local Gemini API..."
+          echo "Waiting for Gemini API..."
+
           GEMINI_READY=0
 
           for i in $(seq 1 45); do
-            if curl -fsS --connect-timeout 3 --max-time 10 \
+            if curl -fsS \
+              --connect-timeout 3 \
+              --max-time 10 \
               "http://$GEMINI_BIND_IP:8081/v1/models" \
               -o "$RUNNER_TEMP/gemini-models.json"; then
+
               GEMINI_READY=1
               break
             fi
+
             sleep 2
           done
 
           if [ "$GEMINI_READY" -ne 1 ]; then
-            warn "Gemini API health check failed. n8n remains running."
+            warn "Gemini API health check failed. n8n remains unaffected."
             docker logs gemini-web2api --tail 100 2>/dev/null || true
             exit 0
           fi
 
-          echo "Testing one non-streaming Gemini request..."
-          GEN_HTTP=$(curl -sS --connect-timeout 10 --max-time 240 \
+          echo "Testing Gemini generation..."
+
+          GEN_HTTP=$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 240 \
             -o "$RUNNER_TEMP/gemini-smoke.json" \
             -w '%{http_code}' \
             -H 'Content-Type: application/json' \
-            -d '{"model":"gemini-3.6-flash","stream":false,"messages":[{"role":"user","content":"Reply exactly: LOCAL GEMINI READY"}]}' \
-            "http://$GEMINI_BIND_IP:8081/v1/chat/completions" 2>/dev/null || true)
+            -d '{
+              "model": "gemini-3.6-flash",
+              "stream": false,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "Reply exactly: LOCAL GEMINI READY"
+                }
+              ]
+            }' \
+            "http://$GEMINI_BIND_IP:8081/v1/chat/completions" \
+            2>/dev/null || true)
 
           if [ "$GEN_HTTP" = "200" ]; then
             echo "Gemini generation smoke test: HTTP 200"
             cat "$RUNNER_TEMP/gemini-smoke.json"
           else
-            warn "Gemini models endpoint is up, but generation smoke test returned HTTP ${GEN_HTTP:-unknown}. n8n remains running."
+            warn "Gemini generation test failed. n8n remains unaffected."
             cat "$RUNNER_TEMP/gemini-smoke.json" 2>/dev/null || true
           fi
 
-          echo "LOCAL GEMINI API READY"
-          echo "Base URL for n8n: http://host.docker.internal:8081/v1"
+          echo "Local Gemini API startup check completed."
+          echo "n8n Base URL: http://host.docker.internal:8081/v1"
           echo "Model: gemini-3.6-flash"
-          echo "Proxy authentication: disabled (private Docker bridge binding only)"
+          echo "Proxy authentication: disabled; private Docker bridge binding."
 
       # ============================================================
       # 6. START SERVICES
@@ -377,17 +402,19 @@ jobs:
 
           docker network create prod-net 2>/dev/null || true
 
-          # Bind the local Gemini API only to the prod-net bridge gateway.
-          # This keeps port 8081 off the runner's public interfaces.
+          # Add the exact private network gateway only when available.
+          # If unavailable, start n8n without the optional Gemini mapping.
           PROD_NET_GW=$(docker network inspect prod-net \
-            --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
-          if [ -z "$PROD_NET_GW" ]; then
-            # Fallback preserves n8n startup; Gemini add-on will skip itself
-            # if it cannot determine the concrete prod-net gateway address.
-            PROD_NET_GW="host-gateway"
-            echo "WARNING: Using Docker host-gateway fallback for n8n."
-          else
+            --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' \
+            2>/dev/null || true)
+
+          N8N_EXTRA_HOST_ARGS=()
+
+          if [ -n "$PROD_NET_GW" ]; then
             echo "Internal Docker gateway: $PROD_NET_GW"
+            N8N_EXTRA_HOST_ARGS+=(--add-host "host.docker.internal:$PROD_NET_GW")
+          else
+            echo "WARNING: Gateway unavailable. Continuing with normal n8n startup."
           fi
 
           docker rm -f n8n caddy cloudflared >/dev/null 2>&1 || true
@@ -416,7 +443,7 @@ jobs:
           docker run -d \
             --name n8n \
             --network prod-net \
-            --add-host "host.docker.internal:$PROD_NET_GW" \
+            "${N8N_EXTRA_HOST_ARGS[@]}" \
             --restart unless-stopped \
             -v "$(pwd)/n8n_data:/home/node/.n8n" \
             -e NODE_PATH="/home/node/.n8n/nodes/node_modules" \
@@ -443,22 +470,25 @@ jobs:
             -e N8N_WORKFLOW_HISTORY_ENABLED=false \
             -e N8N_DIAGNOSTICS_ENABLED=false \
             -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
-            -e NODE_FUNCTION_ALLOW_BUILTIN=* \
-            -e NODE_FUNCTION_ALLOW_EXTERNAL=* \
+            -e 'NODE_FUNCTION_ALLOW_BUILTIN=*' \
+            -e 'NODE_FUNCTION_ALLOW_EXTERNAL=*' \
             n8nio/n8n:latest
 
           echo "Waiting for n8n health..."
 
           HEALTHY=0
+
           for i in {1..150}; do
             if docker exec n8n node -e "
               fetch('http://127.0.0.1:5678/healthz')
                 .then(r => process.exit(r.ok ? 0 : 1))
                 .catch(() => process.exit(1))
             " >/dev/null 2>&1; then
+
               HEALTHY=1
               break
             fi
+
             sleep 2
           done
 
@@ -479,7 +509,7 @@ jobs:
           set -u
 
           if ! docker inspect gemini-web2api >/dev/null 2>&1; then
-            echo "::warning::Gemini container is unavailable; n8n remains healthy."
+            echo "::warning::Gemini container unavailable. n8n remains healthy."
             exit 0
           fi
 
@@ -487,10 +517,12 @@ jobs:
           fetch("http://host.docker.internal:8081/v1/models")
             .then(async (r) => {
               const body = await r.text();
+
               if (!r.ok) {
                 console.error("Gemini returned HTTP", r.status, body.slice(0, 500));
                 process.exit(1);
               }
+
               console.log("n8n can reach local Gemini API: HTTP", r.status);
             })
             .catch((e) => {
@@ -498,14 +530,16 @@ jobs:
               process.exit(1);
             });
           '; then
+
             echo "n8n-to-Gemini local connection verified."
           else
-            echo "::warning::Gemini local connection test failed. Existing n8n service remains running."
+            echo "::warning::Gemini connection test failed. n8n remains healthy."
             docker logs gemini-web2api --tail 60 2>/dev/null || true
           fi
 
       # ============================================================
       # 8. VERIFIED BACKUP + ROTATION
+      # Original backup and rotation logic preserved.
       # ============================================================
       - name: Backup State and Keep Alive
         env:
@@ -611,31 +645,10 @@ jobs:
           ROTATE_AFTER=19800
           LAST_BACKUP=0
           BACKUP_INTERVAL=900
-          LAST_METRICS=0
-          METRICS_INTERVAL=60
 
           while true; do
             NOW=$(date +%s)
             ELAPSED=$((NOW - START))
-
-            # Lightweight host + per-container resource report every minute.
-            if [ "$((NOW - LAST_METRICS))" -ge "$METRICS_INTERVAL" ]; then
-              echo ""
-              echo "========== RUNNER RESOURCE REPORT =========="
-              date -u '+UTC: %Y-%m-%d %H:%M:%S'
-              echo "Logical CPU cores: $(nproc 2>/dev/null || echo unknown)"
-              echo "Load average: $(cat /proc/loadavg 2>/dev/null || echo unavailable)"
-              echo "Host memory:"
-              free -h 2>/dev/null || true
-              echo "Root disk:"
-              df -h / 2>/dev/null | tail -n 1 || true
-              echo "Container CPU / RAM / network / disk I/O:"
-              docker stats --no-stream \
-                --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}' \
-                2>/dev/null || true
-              echo "============================================="
-              LAST_METRICS=$NOW
-            fi
 
             # 5 hours 30 minutes: trigger successor before hard limit.
             if [ "$ELAPSED" -ge "$ROTATE_AFTER" ]; then
@@ -672,7 +685,7 @@ jobs:
               docker start cloudflared >/dev/null 2>&1 || true
             fi
 
-            # Gemini is an optional add-on: restart it if its container exists.
+            # Gemini is optional. Restart it if its container exits.
             if docker inspect gemini-web2api >/dev/null 2>&1; then
               if ! docker ps --format '{{.Names}}' | grep -qx gemini-web2api; then
                 echo "WARNING: Gemini proxy stopped; attempting restart."
@@ -680,7 +693,7 @@ jobs:
               fi
             fi
 
-            # Periodic backup every 15 minutes.
+            # Original periodic backup every 15 minutes.
             if [ "$((NOW - LAST_BACKUP))" -ge "$BACKUP_INTERVAL" ]; then
               if upload_state; then
                 LAST_BACKUP=$NOW
